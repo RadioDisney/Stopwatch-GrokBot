@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <cctype>
 #include <cstdlib>
 #include <cstring>
 
@@ -13,6 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "grokbot_player.h"
+#include "face_scaler.h"
 
 extern "C" const uint8_t grokbot_atlas_start[] asm("_binary_grokbot_atlas_start");
 extern "C" const uint8_t grokbot_atlas_end[] asm("_binary_grokbot_atlas_end");
@@ -22,10 +22,13 @@ constexpr const char *TAG = "grokbot";
 constexpr gpio_num_t kButtonA = GPIO_NUM_2;
 constexpr gpio_num_t kButtonB = GPIO_NUM_1;
 constexpr uint32_t kDebounceMs = 180;
+constexpr int kAtlasSize = 400;
+// A 292.5px viewport maps to the 468px panel at exactly 1.6x the original size.
+// The neutral 240px face therefore becomes 384px wide.
+constexpr float kFaceViewportSize = 292.5f;
 
 GrokBotPlayer g_player;
-uint16_t g_palette[16];
-uint32_t g_pair_lut[256];
+FaceScaler g_face_scaler;
 uint8_t *g_packed = nullptr;
 uint8_t *g_delta = nullptr;
 bool g_reverse = false;
@@ -43,18 +46,15 @@ int64_t g_button_b_edge = 0;
 int64_t g_decode_us = 0;
 int64_t g_push_us = 0;
 int g_manual_index = 0;
-const char *g_overlay_name = nullptr;
+const char *g_state_name = nullptr;
 
 void expand_packed_to_canvas()
 {
-    auto *pixels = static_cast<uint32_t *>(canvas.getBuffer());
+    auto *pixels = static_cast<uint16_t *>(canvas.getBuffer());
     if (pixels == nullptr) {
         return;
     }
-    const size_t packed_size = g_player.packed_frame_size();
-    for (size_t i = 0; i < packed_size; ++i) {
-        pixels[i] = g_pair_lut[g_packed[i]];
-    }
+    g_face_scaler.render(g_packed, pixels);
 }
 
 bool decode_frame(const GrokBotPlayer::FrameInfo &frame, bool expand)
@@ -105,32 +105,8 @@ bool decode_backward_frame(const GrokBotPlayer::FrameInfo &frame)
     return true;
 }
 
-void draw_overlay()
-{
-    const char *name = g_overlay_name != nullptr ? g_overlay_name : g_player.selected_name();
-    char label[16] = {};
-    size_t n = 0;
-    while (name[n] != '\0' && n + 1 < sizeof(label)) {
-        label[n] = static_cast<char>(std::toupper(static_cast<unsigned char>(name[n])));
-        ++n;
-    }
-    label[n] = '\0';
-
-    canvas.setTextDatum(textdatum_t::middle_center);
-    canvas.setFont(&fonts::Font0);
-    canvas.fillRect(0, canvas.height() - 38, canvas.width(), 38, TFT_BLACK);
-    canvas.setTextSize(2);
-    canvas.setTextColor(TFT_WHITE, TFT_BLACK);
-    canvas.drawString(label, canvas.width() / 2, canvas.height() - 29);
-
-    canvas.setTextSize(1);
-    canvas.setTextColor(0x8410, TFT_BLACK);
-    canvas.drawString("A/B SWITCH  TAP NEXT", canvas.width() / 2, canvas.height() - 10);
-}
-
 bool display_decoded_frame()
 {
-    draw_overlay();
     const int64_t push_start = esp_timer_get_time();
     canvas.pushSprite(&gfx, (gfx.width() - canvas.width()) / 2,
                       (gfx.height() - canvas.height()) / 2);
@@ -203,9 +179,9 @@ void apply_state(int index)
         return;
     }
     g_player.seek(g_player.start_frame());
-        g_rebuild_pending = true;
-    g_overlay_name = g_player.clip_name(index);
-    ESP_LOGI(TAG, "state -> %s", g_overlay_name);
+    g_rebuild_pending = true;
+    g_state_name = g_player.clip_name(index);
+    ESP_LOGI(TAG, "state -> %s", g_state_name);
 }
 
 void switch_state(int delta)
@@ -265,7 +241,7 @@ extern "C" void app_main(void)
         }
     }
 
-    constexpr size_t kPackedFrameBytes = 400 * 400 / 2;
+    constexpr size_t kPackedFrameBytes = kAtlasSize * kAtlasSize / 2;
     g_packed = static_cast<uint8_t *>(heap_caps_malloc(
         kPackedFrameBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     g_delta = static_cast<uint8_t *>(heap_caps_malloc(
@@ -285,16 +261,6 @@ extern "C" void app_main(void)
         }
     }
 
-    for (int i = 0; i < 16; ++i) {
-        const uint8_t v = static_cast<uint8_t>(i * 17);
-        g_palette[i] = lgfx::swap565(v, v, v);
-    }
-    for (int i = 0; i < 256; ++i) {
-        const uint16_t c0 = g_palette[i >> 4];
-        const uint16_t c1 = g_palette[i & 0x0f];
-        g_pair_lut[i] = static_cast<uint32_t>(c0) | (static_cast<uint32_t>(c1) << 16);
-    }
-
     if (!g_player.init(grokbot_atlas_start, static_cast<size_t>(grokbot_atlas_end - grokbot_atlas_start))) {
         ESP_LOGE(TAG, "Animation atlas initialization failed");
         while (true) {
@@ -302,9 +268,20 @@ extern "C" void app_main(void)
         }
     }
 
+    if (g_player.width() != kAtlasSize || g_player.height() != kAtlasSize ||
+        g_player.packed_frame_size() != kPackedFrameBytes ||
+        !g_face_scaler.init(kAtlasSize, canvas.width(), canvas.height(), kFaceViewportSize)) {
+        ESP_LOGE(TAG, "Unsupported atlas or fullscreen canvas dimensions");
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+    ESP_LOGI(TAG, "Fullscreen face: %.1fx%.1f crop -> %dx%d canvas", kFaceViewportSize,
+             kFaceViewportSize, canvas.width(), canvas.height());
+
     g_player.seek(g_player.start_frame());
     g_rebuild_pending = true;
-    g_overlay_name = g_player.clip_name(0);
+    g_state_name = g_player.clip_name(0);
     ESP_LOGI(TAG, "Atlas: %dx%d, %d states, %u fps",
              g_player.width(), g_player.height(), g_player.clip_count(),
              static_cast<unsigned>(g_player.fps()));
@@ -362,7 +339,7 @@ extern "C" void app_main(void)
             const uint32_t frames = frames_since_report;
             ESP_LOGI(TAG, "fps=%lu state=%s frame=%d/%d loop=%d decode=%ldus push=%ldus",
                      static_cast<unsigned long>(frames),
-                     g_overlay_name != nullptr ? g_overlay_name : g_player.selected_name(),
+                     g_state_name != nullptr ? g_state_name : g_player.selected_name(),
                      g_player.current_index(), g_player.selected_frame_count(),
                      g_player.start_frame(),
                      static_cast<long>(g_decode_us / (frames ? frames : 1)),

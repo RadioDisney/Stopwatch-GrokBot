@@ -20,8 +20,8 @@ bool display_init()
 
     canvas.setPsram(true);
     canvas.setColorDepth(16);
-    if (canvas.createSprite(400, 400) == nullptr) {
-        ESP_LOGE("display", "Canvas allocation failed (%d x %d)", 400, 400);
+    if (canvas.createSprite(gfx.width(), gfx.height()) == nullptr) {
+        ESP_LOGE("display", "Canvas allocation failed (%d x %d)", gfx.width(), gfx.height());
         return false;
     }
     canvas.fillScreen(TFT_BLACK);
