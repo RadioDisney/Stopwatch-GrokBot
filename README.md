@@ -24,7 +24,7 @@
 - 单击触摸屏切换到下一个状态；A/B 键控制上一个/下一个状态。
 - 原始图集为 400×400、16 级灰度；全屏输出为 468×468，播放目标 30 FPS。
 - 帧间 XOR + zlib 压缩，完整图集约 **8.39 MiB**。
-- 直连 CO5300；全屏版的实际帧率需在设备上验证，可从串口查看 `fps=`。
+- 直连 CO5300；1.6 倍顺序循环优化版的默认 IDLE 动画实测稳定 **30 FPS**，优化前约 **16 FPS**。播放按图集原生 30 FPS 定时。
 
 全部状态（原版预览）：
 
@@ -35,7 +35,9 @@
 - 目标：M5Stack StopWatch（C152），ESP32-S3R8，16 MiB Flash，8 MiB PSRAM。
 - 屏幕：CO5300 QSPI AMOLED，468×468 framebuffer，可见 466×466 圆形区域。
 - 原版验证：ESP Workbench 启动、framebuffer 和状态切换通过；实机显示、灰阶、30 FPS、A/B 状态切换正常。
-- 主机验证：缩放插值、RGB565 字节序和内存边界检查通过；53 个状态各顺序循环 3 次，共 19221 个显示帧的顺序、循环重建与状态切换检查通过。尚未进行全屏版实机验证。
+- 主机验证：缩放插值、RGB565 字节序和内存边界检查通过；53 个状态各顺序循环 3 次，共 19221 个显示帧的顺序、循环重建与状态切换检查通过。
+- 优化版实机验证：已烧录 StopWatch，默认 IDLE 连续多个循环保持 30 FPS，含循环起点恢复；全部状态的实机帧率尚未逐个测量。
+- 局部更新验证：6809 次局部更新/整屏重绘逐像素对比通过，包含全部 53 个状态、视口边界、空变化、16 行分块和循环缓存恢复；此测试平均传输像素量为整屏更新的 20.5%。
 
 ## 交互
 
@@ -65,7 +67,7 @@ idf.py merge-bin -o stopwatch_grokbot-full.bin
 生成后上传 `build/stopwatch_grokbot-full.bin`。该文件已合并 bootloader、
 分区表和应用镜像。
 
-本次构建的 1.6 倍顺序循环版完整镜像为 `build/stopwatch_grokbot-1.6x-forward.bin`，
+本次构建的 1.6 倍顺序循环优化版完整镜像为 `build/stopwatch_grokbot-1.6x-forward-fast.bin`，
 烧录起始地址为 **`0x0`**；对应校验文件为 `.bin.sha256`。
 构建信息与验证结果保存在 `build/fullscreen-build-info.json`。
 
@@ -77,7 +79,7 @@ idf.py merge-bin -o stopwatch_grokbot-full.bin
 ```text
 I (...) grokbot: Atlas: 400x400, 53 states, 30 fps
 I (...) grokbot: GROKBOT_READY states=53 fps=30
-I (...) grokbot: fps=30 state=idle frame=... start=2 decode=...us push=...us
+I (...) grokbot: fps=30.0 state=idle frame=... decode=...us scale=...us push=...us input=...us max_work=...us update=...%
 ```
 
 ## 设备端实现
@@ -85,12 +87,12 @@ I (...) grokbot: fps=30 state=idle frame=... start=2 decode=...us push=...us
 1. 浏览器按 30 FPS 逐帧渲染 53 个状态。
 2. 每帧量化为 4-bit 灰度，帧间做 XOR delta，再用 zlib 压缩。
 3. ESP32-S3 使用 ROM 自带 miniz 逐帧解压，经 XOR 还原 4-bit 灰度帧。
-4. 使用面板字节序的灰度查找表写入 sprite 的 `rgb565_2Byte` 缓冲区。
-5. 使用中央 292.5×292.5 视口，以原始图像的 1.6 倍和双线性插值生成 468×468 RGB565 帧；缓存横向插值行，减少重复计算。
-6. 禁用 M5GFX 的整屏 PSRAM 中间帧缓冲，468×468 sprite 直接送入 CO5300。
-7. 状态动画采用顺序循环；播放到末帧后回到起始帧，并从完整帧重建 XOR 基准，避免循环衔接时重影。
+4. XOR/完整帧更新按 32-bit 分组比较，并记录 16×16 源图块的变化位图；只缩放和传输受影响的输出图块，同一行相邻图块合并传输。检查完整双线性采样范围，输出 x/width 对齐为偶数。
+5. 使用中央 292.5×292.5 视口，以原始图像的 1.6 倍生成 RGB565；缓存横向插值行，减少重复计算。
+6. 禁用 M5GFX 的整屏 PSRAM 中间帧缓冲与 sprite。使用两块内部 SRAM 的 16 行 DMA 缓冲，缩放下一块时传输上一块，降低内存流量与传输等待。
+7. 状态动画采用顺序循环；第一次重建第 3 帧时缓存 80KB 的 4-bit 帧，回到起点时直接恢复并计算变化区域，避免重复解压第 0/1/2 帧。缓存分配失败时回退为重建路径。
 8. 每个 clip 首帧为完整帧，其余帧使用 XOR delta，保持较小的 Flash 占用。
-9. 所有状态从索引 2（第 3 帧）开始；切换状态或循环回起点时，从目标状态第 0 帧完整重建到起始帧，避免 XOR 基准残留造成重影。
+9. 切换状态时从第 0 帧重建到第 3 帧并整屏刷新，清除前一状态残影；每秒输出实际 FPS、解码、缩放、传输等待、输入轮询、最大工作耗时和更新面积。
 
 主机缩放检查（无需 ESP-IDF）：
 
@@ -120,7 +122,8 @@ node bake.mjs
 main/board.cpp           PMIC、IO expander、触摸和按键初始化
 main/display.cpp         CO5300 / M5GFX 显示初始化
 main/grokbot_player.cpp  GBZ1 压缩图集和帧索引解析
-main/face_scaler.cpp     中央脸部裁切、双线性插值和全屏 RGB565 输出
+main/face_scaler.cpp     中央脸部裁切、插值查找表和局部 RGB565 输出
+main/frame_region.h     32-bit 帧更新与变化图块位图
 main/main.cpp            zlib 解压、帧重建、轻点切换和顺序循环主循环
 main/grokbot.atlas       53 状态和循环数据的设备内嵌图集
 tools/grokbot/           浏览器烘焙和 zlib 编码工具

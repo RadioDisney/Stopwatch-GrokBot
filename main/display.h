@@ -2,6 +2,7 @@
 
 #include <M5GFX.h>
 #include <lgfx/v1/panel/Panel_AMOLED.hpp>
+#include "face_scaler.h"
 
 class Panel_CO5300 : public lgfx::Panel_AMOLED {
 public:
@@ -112,8 +113,9 @@ public:
 };
 
 extern M5StopWatch gfx;
-extern M5Canvas canvas;
 
 bool display_init();
 int display_width();
 int display_height();
+void display_frame(const uint8_t *packed, FaceScaler &scaler, const FrameDamage &damage,
+                   int64_t *scale_us, int64_t *push_us, uint64_t *updated_pixels);

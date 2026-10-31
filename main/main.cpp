@@ -31,6 +31,9 @@ GrokBotPlayer g_player;
 FaceScaler g_face_scaler;
 uint8_t *g_packed = nullptr;
 uint8_t *g_delta = nullptr;
+uint8_t *g_loop_start = nullptr;
+bool g_loop_start_valid = false;
+FrameDamage g_damage;
 bool g_rebuild_pending = false;
 bool g_button_a_last = true;
 bool g_button_b_last = true;
@@ -43,20 +46,15 @@ int64_t g_touch_start_ms = 0;
 int64_t g_button_a_edge = 0;
 int64_t g_button_b_edge = 0;
 int64_t g_decode_us = 0;
+int64_t g_scale_us = 0;
 int64_t g_push_us = 0;
+int64_t g_input_us = 0;
+int64_t g_max_work_us = 0;
+uint64_t g_updated_pixels = 0;
 int g_manual_index = 0;
 const char *g_state_name = nullptr;
 
-void expand_packed_to_canvas()
-{
-    auto *pixels = static_cast<uint16_t *>(canvas.getBuffer());
-    if (pixels == nullptr) {
-        return;
-    }
-    g_face_scaler.render(g_packed, pixels);
-}
-
-bool decode_frame(const GrokBotPlayer::FrameInfo &frame, bool expand)
+bool decode_frame(const GrokBotPlayer::FrameInfo &frame)
 {
     if (frame.data == nullptr || frame.compressed_size == 0 ||
         g_packed == nullptr || g_delta == nullptr) {
@@ -73,25 +71,13 @@ bool decode_frame(const GrokBotPlayer::FrameInfo &frame, bool expand)
         return false;
     }
 
-    auto *pixels = static_cast<uint32_t *>(canvas.getBuffer());
-    if (pixels == nullptr) {
-        return false;
-    }
-    for (size_t i = 0; i < packed_size; ++i) {
-        g_packed[i] = frame.delta ? (g_packed[i] ^ g_delta[i]) : g_delta[i];
-    }
-    if (expand) {
-        expand_packed_to_canvas();
-    }
+    update_packed_frame(g_packed, g_delta, kAtlasSize, kAtlasSize, frame.delta, &g_damage);
     return true;
 }
 
 bool display_decoded_frame()
 {
-    const int64_t push_start = esp_timer_get_time();
-    canvas.pushSprite(&gfx, (gfx.width() - canvas.width()) / 2,
-                      (gfx.height() - canvas.height()) / 2);
-    g_push_us += esp_timer_get_time() - push_start;
+    display_frame(g_packed, g_face_scaler, g_damage, &g_scale_us, &g_push_us, &g_updated_pixels);
     return true;
 }
 
@@ -102,7 +88,7 @@ bool render_current_frame()
         return false;
     }
     const int64_t decode_start = esp_timer_get_time();
-    if (!decode_frame(frame, true)) {
+    if (!decode_frame(frame)) {
         ESP_LOGE(TAG, "Atlas frame decode failed");
         return false;
     }
@@ -112,22 +98,24 @@ bool render_current_frame()
 
 bool render_rebuilt_current()
 {
+    const int64_t decode_start = esp_timer_get_time();
     const int target = g_player.current_index();
-    if (!g_player.seek(0)) {
-        return false;
-    }
-    for (int i = 0; i <= target; ++i) {
-        GrokBotPlayer::FrameInfo frame = {};
-        if (!g_player.frame_info(i, &frame)) {
-            return false;
+    if (target == g_player.start_frame() && g_loop_start_valid) {
+        // Restore the already reconstructed loop start without inflating frames 0/1/2.
+        update_packed_frame(g_packed, g_loop_start, kAtlasSize, kAtlasSize, false, &g_damage);
+    } else {
+        for (int i = 0; i <= target; ++i) {
+            GrokBotPlayer::FrameInfo frame = {};
+            if (!g_player.frame_info(i, &frame) || !decode_frame(frame)) return false;
         }
-        if (!decode_frame(frame, i == target)) {
-            return false;
+        // Rebuilding traverses intermediate frames; refresh the final image in full.
+        g_damage.all = true;
+        if (target == g_player.start_frame() && g_loop_start != nullptr) {
+            memcpy(g_loop_start, g_packed, g_player.packed_frame_size());
+            g_loop_start_valid = true;
         }
     }
-    if (!g_player.seek(target)) {
-        return false;
-    }
+    g_decode_us += esp_timer_get_time() - decode_start;
     g_rebuild_pending = false;
     return display_decoded_frame();
 }
@@ -138,6 +126,7 @@ void apply_state(int index)
         return;
     }
     g_manual_index = index;
+    g_loop_start_valid = false;
     if (!g_player.select(index)) {
         return;
     }
@@ -224,6 +213,12 @@ extern "C" void app_main(void)
         }
     }
 
+    memset(g_packed, 0, kPackedFrameBytes);
+    // This optional cache needs only 80KB in PSRAM, not a full RGB frame.
+    g_loop_start = static_cast<uint8_t *>(heap_caps_malloc(
+        kPackedFrameBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    ESP_LOGI(TAG, "Decode buffers: packed=%p delta=%p loop_cache=%p", g_packed, g_delta, g_loop_start);
+
     if (!g_player.init(grokbot_atlas_start, static_cast<size_t>(grokbot_atlas_end - grokbot_atlas_start))) {
         ESP_LOGE(TAG, "Animation atlas initialization failed");
         while (true) {
@@ -233,14 +228,14 @@ extern "C" void app_main(void)
 
     if (g_player.width() != kAtlasSize || g_player.height() != kAtlasSize ||
         g_player.packed_frame_size() != kPackedFrameBytes ||
-        !g_face_scaler.init(kAtlasSize, canvas.width(), canvas.height(), kFaceViewportSize)) {
+        !g_face_scaler.init(kAtlasSize, display_width(), display_height(), kFaceViewportSize)) {
         ESP_LOGE(TAG, "Unsupported atlas or fullscreen canvas dimensions");
         while (true) {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
     ESP_LOGI(TAG, "Fullscreen face: %.1fx%.1f crop -> %dx%d canvas", kFaceViewportSize,
-             kFaceViewportSize, canvas.width(), canvas.height());
+             kFaceViewportSize, display_width(), display_height());
 
     g_player.seek(g_player.start_frame());
     g_rebuild_pending = true;
@@ -257,14 +252,20 @@ extern "C" void app_main(void)
     int64_t report_time = next_frame;
 
     while (true) {
+        const int64_t work_start = esp_timer_get_time();
         poll_inputs();
+        g_input_us += esp_timer_get_time() - work_start;
 
         const bool rendered = g_rebuild_pending ? render_rebuilt_current() : render_current_frame();
         if (rendered) {
             // advance() wraps to the clip's start frame. Rebuild its XOR base
             // from frame 0 before displaying it, never from the previous loop's tail.
             g_rebuild_pending = g_player.advance();
+            ++frames_since_report;
+        } else {
+            g_rebuild_pending = true;
         }
+        g_max_work_us = std::max(g_max_work_us, esp_timer_get_time() - work_start);
 
         next_frame += frame_us;
         const int64_t now = esp_timer_get_time();
@@ -279,20 +280,24 @@ extern "C" void app_main(void)
             next_frame = now;
         }
 
-        ++frames_since_report;
-        if (now - report_time >= 1000000) {
+        const int64_t report_now = esp_timer_get_time();
+        if (report_now - report_time >= 1000000) {
             const uint32_t frames = frames_since_report;
-            ESP_LOGI(TAG, "fps=%lu state=%s frame=%d/%d loop=%d decode=%ldus push=%ldus",
-                     static_cast<unsigned long>(frames),
-                     g_state_name != nullptr ? g_state_name : g_player.selected_name(),
-                     g_player.current_index(), g_player.selected_frame_count(),
-                     g_player.start_frame(),
-                     static_cast<long>(g_decode_us / (frames ? frames : 1)),
-                     static_cast<long>(g_push_us / (frames ? frames : 1)));
+            const uint32_t divisor = frames ? frames : 1;
+            const double fps = frames * 1000000.0 / (report_now - report_time);
+            const double update_percent = 100.0 * g_updated_pixels /
+                (static_cast<uint64_t>(divisor) * display_width() * display_height());
+            ESP_LOGI(TAG, "fps=%.1f state=%s frame=%d/%d decode=%ldus scale=%ldus "
+                         "push=%ldus input=%ldus max_work=%ldus update=%.1f%%",
+                     fps, g_player.selected_name(), g_player.current_index(),
+                     g_player.selected_frame_count(), static_cast<long>(g_decode_us / divisor),
+                     static_cast<long>(g_scale_us / divisor), static_cast<long>(g_push_us / divisor),
+                     static_cast<long>(g_input_us / divisor), static_cast<long>(g_max_work_us),
+                     update_percent);
             frames_since_report = 0;
-            g_decode_us = 0;
-            g_push_us = 0;
-            report_time = now;
+            g_decode_us = g_scale_us = g_push_us = g_input_us = g_max_work_us = 0;
+            g_updated_pixels = 0;
+            report_time = report_now;
         }
     }
 }
