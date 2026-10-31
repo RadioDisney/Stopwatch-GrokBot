@@ -20,7 +20,7 @@
 - 网页中的 **53 个命名状态已全部加入**：生命周期、反应、morph、产品状态和品牌动画。
 - 9 种表情、13 类 morph、28 段 clip 的视觉类型均包含在状态库中。
 - 所有状态统一从第 3 帧开始播放。
-- 每个状态播放到末帧后按帧反放回循环起点，再正向播放；不再硬跳首帧。
+- 每个状态从第 3 帧顺序播放到末帧，再返回第 3 帧，持续顺序循环。
 - 单击触摸屏切换到下一个状态；A/B 键控制上一个/下一个状态。
 - 原始图集为 400×400、16 级灰度；全屏输出为 468×468，播放目标 30 FPS。
 - 帧间 XOR + zlib 压缩，完整图集约 **8.39 MiB**。
@@ -35,7 +35,7 @@
 - 目标：M5Stack StopWatch（C152），ESP32-S3R8，16 MiB Flash，8 MiB PSRAM。
 - 屏幕：CO5300 QSPI AMOLED，468×468 framebuffer，可见 466×466 圆形区域。
 - 原版验证：ESP Workbench 启动、framebuffer 和状态切换通过；实机显示、灰阶、30 FPS、A/B 状态切换正常。
-- 全屏版主机验证：缩放插值、RGB565 字节序、内存边界，以及全部 53 个状态的 6513 帧解码和反向 XOR 还原通过。尚未进行全屏版实机验证。
+- 主机验证：缩放插值、RGB565 字节序和内存边界检查通过；53 个状态各顺序循环 3 次，共 19221 个显示帧的顺序、循环重建与状态切换检查通过。尚未进行全屏版实机验证。
 
 ## 交互
 
@@ -65,7 +65,7 @@ idf.py merge-bin -o stopwatch_grokbot-full.bin
 生成后上传 `build/stopwatch_grokbot-full.bin`。该文件已合并 bootloader、
 分区表和应用镜像。
 
-本次构建的 1.6 倍版完整镜像为 `build/stopwatch_grokbot-1.6x.bin`，
+本次构建的 1.6 倍顺序循环版完整镜像为 `build/stopwatch_grokbot-1.6x-forward.bin`，
 烧录起始地址为 **`0x0`**；对应校验文件为 `.bin.sha256`。
 构建信息与验证结果保存在 `build/fullscreen-build-info.json`。
 
@@ -88,9 +88,9 @@ I (...) grokbot: fps=30 state=idle frame=... start=2 decode=...us push=...us
 4. 使用面板字节序的灰度查找表写入 sprite 的 `rgb565_2Byte` 缓冲区。
 5. 使用中央 292.5×292.5 视口，以原始图像的 1.6 倍和双线性插值生成 468×468 RGB565 帧；缓存横向插值行，减少重复计算。
 6. 禁用 M5GFX 的整屏 PSRAM 中间帧缓冲，468×468 sprite 直接送入 CO5300。
-7. 状态动画采用正放/倒放的 ping-pong 循环；倒放时用当前帧的 XOR 差分反推上一帧，不需要额外存储反向帧。
+7. 状态动画采用顺序循环；播放到末帧后回到起始帧，并从完整帧重建 XOR 基准，避免循环衔接时重影。
 8. 每个 clip 首帧为完整帧，其余帧使用 XOR delta，保持较小的 Flash 占用。
-9. 所有状态从索引 2（第 3 帧）开始；切换时从目标状态第 0 帧完整重建到起始帧，避免 XOR 基准残留造成重影。
+9. 所有状态从索引 2（第 3 帧）开始；切换状态或循环回起点时，从目标状态第 0 帧完整重建到起始帧，避免 XOR 基准残留造成重影。
 
 主机缩放检查（无需 ESP-IDF）：
 
@@ -121,7 +121,7 @@ main/board.cpp           PMIC、IO expander、触摸和按键初始化
 main/display.cpp         CO5300 / M5GFX 显示初始化
 main/grokbot_player.cpp  GBZ1 压缩图集和帧索引解析
 main/face_scaler.cpp     中央脸部裁切、双线性插值和全屏 RGB565 输出
-main/main.cpp            zlib 解压、帧重建、轻点切换和 ping-pong 主循环
+main/main.cpp            zlib 解压、帧重建、轻点切换和顺序循环主循环
 main/grokbot.atlas       53 状态和循环数据的设备内嵌图集
 tools/grokbot/           浏览器烘焙和 zlib 编码工具
 third_party/grokbot/     原版浏览器播放器与 recipe

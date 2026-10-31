@@ -31,7 +31,6 @@ GrokBotPlayer g_player;
 FaceScaler g_face_scaler;
 uint8_t *g_packed = nullptr;
 uint8_t *g_delta = nullptr;
-bool g_reverse = false;
 bool g_rebuild_pending = false;
 bool g_button_a_last = true;
 bool g_button_b_last = true;
@@ -87,24 +86,6 @@ bool decode_frame(const GrokBotPlayer::FrameInfo &frame, bool expand)
     return true;
 }
 
-bool decode_backward_frame(const GrokBotPlayer::FrameInfo &frame)
-{
-    if (!frame.delta || frame.data == nullptr || frame.compressed_size == 0) {
-        return false;
-    }
-    const size_t packed_size = g_player.packed_frame_size();
-    const size_t unpacked = tinfl_decompress_mem_to_mem(
-        g_delta, packed_size, frame.data, frame.compressed_size,
-        TINFL_FLAG_PARSE_ZLIB_HEADER);
-    if (unpacked != packed_size) {
-        return false;
-    }
-    for (size_t i = 0; i < packed_size; ++i) {
-        g_packed[i] ^= g_delta[i];
-    }
-    return true;
-}
-
 bool display_decoded_frame()
 {
     const int64_t push_start = esp_timer_get_time();
@@ -151,30 +132,12 @@ bool render_rebuilt_current()
     return display_decoded_frame();
 }
 
-bool render_backward_frame()
-{
-    GrokBotPlayer::FrameInfo frame = {};
-    if (!g_player.current_frame(&frame)) {
-        return false;
-    }
-    const int64_t decode_start = esp_timer_get_time();
-    if (!decode_backward_frame(frame)) {
-        return false;
-    }
-    g_player.retreat();
-    expand_packed_to_canvas();
-    g_decode_us += esp_timer_get_time() - decode_start;
-    return display_decoded_frame();
-}
-
-
 void apply_state(int index)
 {
     if (index < 0 || index >= g_player.clip_count()) {
         return;
     }
     g_manual_index = index;
-    g_reverse = false;
     if (!g_player.select(index)) {
         return;
     }
@@ -296,29 +259,11 @@ extern "C" void app_main(void)
     while (true) {
         poll_inputs();
 
-        if (g_rebuild_pending) {
-            render_rebuilt_current();
-            g_player.advance();
-        } else if (!g_reverse) {
-            render_current_frame();
-            const int count = g_player.selected_frame_count();
-            if (g_player.current_index() + 1 >= count) {
-                g_reverse = true;
-            } else {
-                g_player.advance();
-            }
-        } else {
-            const int lower = g_player.start_frame();
-            if (g_player.current_index() <= lower) {
-                g_reverse = false;
-                if (g_player.current_index() + 1 < g_player.selected_frame_count()) {
-                    g_player.seek(g_player.current_index() + 1);
-                }
-                render_current_frame();
-                g_player.advance();
-            } else {
-                render_backward_frame();
-            }
+        const bool rendered = g_rebuild_pending ? render_rebuilt_current() : render_current_frame();
+        if (rendered) {
+            // advance() wraps to the clip's start frame. Rebuild its XOR base
+            // from frame 0 before displaying it, never from the previous loop's tail.
+            g_rebuild_pending = g_player.advance();
         }
 
         next_frame += frame_us;
